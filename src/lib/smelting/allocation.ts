@@ -1,0 +1,359 @@
+import { NUGGETS_PER_INGOT, UNITS_PER_NUGGET } from "../constants";
+import type {
+  AlloyAllocationResult,
+  AlloyPartConstraint,
+  AlloySplitResult,
+  PureAllocationResult
+} from "./types";
+
+type NuggetBounds = {
+  minNuggets: number;
+  maxNuggets: number;
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const normalizeTargetPercents = (parts: AlloyPartConstraint[]) => {
+  const rawTargets = parts.map((part) => {
+    const midpoint = (part.min + part.max) / 2;
+    const preferred = Number.isFinite(part.pct) ? (part.pct ?? midpoint) : midpoint;
+    return clamp(preferred, part.min, part.max);
+  });
+
+  const total = rawTargets.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) {
+    return rawTargets.map(() => 100 / Math.max(parts.length, 1));
+  }
+
+  return rawTargets.map((value) => (value / total) * 100);
+};
+
+const buildBounds = (totalNuggets: number, parts: AlloyPartConstraint[]): NuggetBounds[] =>
+  parts.map((part) => ({
+    minNuggets: Math.ceil((totalNuggets * part.min) / 100),
+    maxNuggets: Math.floor((totalNuggets * part.max) / 100)
+  }));
+
+const isFeasibleTotal = (totalNuggets: number, bounds: NuggetBounds[]) => {
+  const minSum = bounds.reduce((sum, bound) => sum + bound.minNuggets, 0);
+  const maxSum = bounds.reduce((sum, bound) => sum + bound.maxNuggets, 0);
+  return minSum <= totalNuggets && totalNuggets <= maxSum;
+};
+
+const findFeasibleTotalNuggets = (
+  requiredNuggets: number,
+  parts: AlloyPartConstraint[],
+  step = 1
+): number | null => {
+  const maxAttempts = 5000;
+  const safeStep = Math.max(1, Math.floor(step));
+  let totalNuggets = Math.max(0, requiredNuggets);
+  if (safeStep > 1) {
+    totalNuggets = Math.ceil(totalNuggets / safeStep) * safeStep;
+  }
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const bounds = buildBounds(totalNuggets, parts);
+    if (isFeasibleTotal(totalNuggets, bounds)) {
+      return totalNuggets;
+    }
+    totalNuggets += safeStep;
+  }
+
+  return null;
+};
+
+const allocateWithinBounds = (
+  totalNuggets: number,
+  bounds: NuggetBounds[],
+  targetPercents: number[]
+) => {
+  const allocation = bounds.map((bound) => bound.minNuggets);
+  let remaining = totalNuggets - allocation.reduce((sum, value) => sum + value, 0);
+
+  while (remaining > 0) {
+    let bestIdx = -1;
+    let bestImprovement = Number.NEGATIVE_INFINITY;
+    let bestGap = Number.NEGATIVE_INFINITY;
+
+    for (let idx = 0; idx < allocation.length; idx += 1) {
+      const current = allocation[idx];
+      const bound = bounds[idx];
+      const targetPct = targetPercents[idx];
+      if (!bound || targetPct === undefined || current === undefined) continue;
+      if (current >= bound.maxNuggets) continue;
+
+      const ideal = (totalNuggets * targetPct) / 100;
+      const currentError = Math.abs(current - ideal);
+      const nextError = Math.abs(current + 1 - ideal);
+      const improvement = currentError - nextError;
+      const gap = ideal - current;
+
+      if (
+        improvement > bestImprovement ||
+        (improvement === bestImprovement && gap > bestGap) ||
+        (improvement === bestImprovement && gap === bestGap && idx < bestIdx)
+      ) {
+        bestIdx = idx;
+        bestImprovement = improvement;
+        bestGap = gap;
+      }
+    }
+
+    if (bestIdx === -1) break;
+    allocation[bestIdx] = (allocation[bestIdx] ?? 0) + 1;
+    remaining -= 1;
+  }
+
+  if (remaining > 0) {
+    for (let idx = 0; idx < allocation.length && remaining > 0; idx += 1) {
+      const current = allocation[idx];
+      const bound = bounds[idx];
+      if (!bound || current === undefined) continue;
+      const room = bound.maxNuggets - current;
+      if (room <= 0) continue;
+      const add = Math.min(room, remaining);
+      allocation[idx] = current + add;
+      remaining -= add;
+    }
+  }
+
+  return allocation;
+};
+
+export const calculatePureMetalAllocation = (
+  requiredUnits: number,
+  metal: string,
+  color?: string
+): PureAllocationResult => {
+  const safeUnits = Math.max(0, Number.isFinite(requiredUnits) ? requiredUnits : 0);
+  const requiredNuggets = Math.ceil(safeUnits / UNITS_PER_NUGGET);
+  const producedUnits = requiredNuggets * UNITS_PER_NUGGET;
+
+  return {
+    requiredUnits: safeUnits,
+    requiredNuggets,
+    producedUnits,
+    overageUnits: producedUnits - safeUnits,
+    metals: [
+      {
+        metal,
+        color,
+        nuggets: requiredNuggets,
+        units: producedUnits
+      }
+    ]
+  };
+};
+
+export const calculateAlloyAllocation = (
+  requiredUnits: number,
+  parts: AlloyPartConstraint[]
+): AlloyAllocationResult => {
+  const safeUnits = Math.max(0, Number.isFinite(requiredUnits) ? requiredUnits : 0);
+  if (!parts.length) {
+    return {
+      requiredUnits: safeUnits,
+      totalNuggets: 0,
+      producedUnits: 0,
+      overageUnits: -safeUnits,
+      parts: []
+    };
+  }
+
+  const requiredNuggets = Math.ceil(safeUnits / UNITS_PER_NUGGET);
+  if (requiredNuggets === 0) {
+    return {
+      requiredUnits: safeUnits,
+      totalNuggets: 0,
+      producedUnits: 0,
+      overageUnits: -safeUnits,
+      parts: parts.map((part) => ({
+        metal: part.metal,
+        color: part.color,
+        nuggets: 0,
+        units: 0,
+        min: part.min,
+        max: part.max,
+        pctTarget: Number.isFinite(part.pct) ? (part.pct ?? 0) : 0,
+        pctActual: 0
+      }))
+    };
+  }
+
+  const targetPercents = normalizeTargetPercents(parts);
+  const totalNuggets = findFeasibleTotalNuggets(requiredNuggets, parts, NUGGETS_PER_INGOT);
+
+  if (totalNuggets === null) {
+    return {
+      requiredUnits: safeUnits,
+      totalNuggets: 0,
+      producedUnits: 0,
+      overageUnits: -safeUnits,
+      error: "No feasible whole-nugget alloy mix was found for this target and recipe bounds.",
+      parts: parts.map((part, idx) => ({
+        metal: part.metal,
+        color: part.color,
+        nuggets: 0,
+        units: 0,
+        min: part.min,
+        max: part.max,
+        pctTarget: targetPercents[idx] ?? 0,
+        pctActual: 0
+      }))
+    };
+  }
+
+  const bounds = buildBounds(totalNuggets, parts);
+  const allocation = allocateWithinBounds(totalNuggets, bounds, targetPercents);
+  const producedUnits = totalNuggets * UNITS_PER_NUGGET;
+
+  return {
+    requiredUnits: safeUnits,
+    totalNuggets,
+    producedUnits,
+    overageUnits: producedUnits - safeUnits,
+    parts: parts.map((part, idx) => {
+      const nuggets = allocation[idx] ?? 0;
+      const targetPct = targetPercents[idx] ?? 0;
+      return {
+        metal: part.metal,
+        color: part.color,
+        nuggets,
+        units: nuggets * UNITS_PER_NUGGET,
+        min: part.min,
+        max: part.max,
+        pctTarget: targetPct,
+        pctActual: totalNuggets > 0 ? (nuggets / totalNuggets) * 100 : 0
+      };
+    })
+  };
+};
+
+export const calculateAlloySplitFromNuggets = (
+  availableNuggets: Record<string, number>,
+  parts: AlloyPartConstraint[]
+): AlloySplitResult => {
+  if (!parts.length) {
+    return {
+      totalNuggets: 0,
+      producedIngots: 0,
+      remainderNuggets: 0,
+      producedUnits: 0,
+      parts: []
+    };
+  }
+
+  const targetPercents = normalizeTargetPercents(parts);
+  const getAvailable = (part: AlloyPartConstraint) =>
+    Math.max(0, availableNuggets[part.metal] ?? 0);
+
+  // Largest whole-ingot total that could possibly fit within the recipe
+  // minimums and the stock on hand. Starting from this bound (rather than the
+  // preferred percentages) keeps feasible totals from being skipped when a
+  // preferred percentage sits just above a whole-ingot boundary.
+  let maxTotal = Number.POSITIVE_INFINITY;
+  let totalAvailable = 0;
+  for (const part of parts) {
+    const have = getAvailable(part);
+    totalAvailable += have;
+    const minPct = Number.isFinite(part.min) ? Math.max(0, part.min) : 0;
+    if (minPct <= 0) continue;
+    maxTotal = Math.min(maxTotal, (have / minPct) * 100);
+  }
+  maxTotal = Math.min(maxTotal, totalAvailable);
+
+  if (!Number.isFinite(maxTotal) || maxTotal < 1) {
+    return {
+      totalNuggets: 0,
+      producedIngots: 0,
+      remainderNuggets: 0,
+      producedUnits: 0,
+      parts: parts.map((part) => ({
+        metal: part.metal,
+        color: part.color,
+        nuggets: 0,
+        units: 0,
+        available: Math.max(0, availableNuggets[part.metal] ?? 0),
+        leftover: Math.max(0, availableNuggets[part.metal] ?? 0),
+        min: part.min,
+        max: part.max,
+        pctTarget: 0,
+        pctActual: 0
+      }))
+    };
+  }
+
+  const buildBoundsWithStock = (totalNuggets: number): NuggetBounds[] =>
+    parts.map((part) => ({
+      minNuggets: Math.ceil((totalNuggets * part.min) / 100),
+      maxNuggets: Math.min(Math.floor((totalNuggets * part.max) / 100), getAvailable(part))
+    }));
+
+  // Round up to a whole ingot step: the seed only needs to be a safe upper
+  // bound, and every candidate total is re-validated before it is accepted.
+  let usableTotal = Math.ceil(maxTotal / NUGGETS_PER_INGOT) * NUGGETS_PER_INGOT;
+
+  while (usableTotal >= NUGGETS_PER_INGOT) {
+    const bounds = buildBoundsWithStock(usableTotal);
+    const minSum = bounds.reduce((sum, bound) => sum + bound.minNuggets, 0);
+    const maxSum = bounds.reduce((sum, bound) => sum + bound.maxNuggets, 0);
+    if (
+      bounds.every((bound) => bound.minNuggets <= bound.maxNuggets) &&
+      minSum <= usableTotal &&
+      usableTotal <= maxSum
+    ) {
+      const allocation = allocateWithinBounds(usableTotal, bounds, targetPercents);
+      const allFit = parts.every((part, idx) => {
+        const used = allocation[idx] ?? 0;
+        return used <= getAvailable(part);
+      });
+      if (allFit) {
+        const producedIngots = usableTotal / NUGGETS_PER_INGOT;
+        return {
+          totalNuggets: usableTotal,
+          producedIngots,
+          remainderNuggets: 0,
+          producedUnits: usableTotal * UNITS_PER_NUGGET,
+          parts: parts.map((part, idx) => {
+            const nuggets = allocation[idx] ?? 0;
+            const have = getAvailable(part);
+            const pctTarget = targetPercents[idx] ?? 0;
+            return {
+              metal: part.metal,
+              color: part.color,
+              nuggets,
+              units: nuggets * UNITS_PER_NUGGET,
+              available: have,
+              leftover: have - nuggets,
+              min: part.min,
+              max: part.max,
+              pctTarget,
+              pctActual: usableTotal > 0 ? (nuggets / usableTotal) * 100 : 0
+            };
+          })
+        };
+      }
+    }
+    usableTotal -= NUGGETS_PER_INGOT;
+  }
+
+  return {
+    totalNuggets: 0,
+    producedIngots: 0,
+    remainderNuggets: 0,
+    producedUnits: 0,
+    parts: parts.map((part) => ({
+      metal: part.metal,
+      color: part.color,
+      nuggets: 0,
+      units: 0,
+      available: Math.max(0, availableNuggets[part.metal] ?? 0),
+      leftover: Math.max(0, availableNuggets[part.metal] ?? 0),
+      min: part.min,
+      max: part.max,
+      pctTarget: 0,
+      pctActual: 0
+    }))
+  };
+};

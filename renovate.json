@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "platform": "forgejo",
+  "endpoint": "https://codeberg.org/api/v1",
+  "extends": ["config:best-practices"],
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboard": true,
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 5,
+  "schedule": ["before 5am on monday"],
+  "rangeStrategy": "pin",
+  "ignorePaths": [".github/"],
+  "packageRules": [
+    {
+      "matchDepTypes": ["devDependencies"],
+      "groupName": "devDependencies"
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
